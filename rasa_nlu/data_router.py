@@ -6,12 +6,19 @@ from __future__ import unicode_literals
 import glob
 import io
 import logging
+import requests
 import tempfile
 
 import datetime
 import os
+import time
+import zipfile
 from builtins import object
 from concurrent.futures import ProcessPoolExecutor as ProcessPool
+from http.client import InvalidURL
+from threading import Thread
+
+import six
 from future.utils import PY3
 from rasa_nlu.training_data import Message
 
@@ -23,10 +30,16 @@ from rasa_nlu.model import InvalidProjectError
 from rasa_nlu.project import Project
 from rasa_nlu.train import do_train_in_worker, TrainingException
 from rasa_nlu.training_data.loading import load_data
+from rasa_nlu.utils import is_url
 from twisted.internet import reactor
 from twisted.internet.defer import Deferred
 from twisted.logger import jsonFileLogObserver, Logger
 from typing import Text, Dict, Any, Optional, List
+
+if six.PY2:
+    from StringIO import StringIO as IOReader
+else:
+    from io import BytesIO as IOReader
 
 logger = logging.getLogger(__name__)
 
@@ -92,13 +105,17 @@ class DataRouter(object):
                  response_log=None,
                  emulation_mode=None,
                  remote_storage=None,
-                 component_builder=None):
+                 component_builder=None,
+                 model_server=None):
         self._training_processes = max(max_training_processes, 1)
         self._current_training_processes = 0
         self.responses = self._create_query_logger(response_log)
         self.project_dir = config.make_path_absolute(project_dir)
         self.emulator = self._create_emulator(emulation_mode)
         self.remote_storage = remote_storage
+        self.model_server = model_server
+        if self.model_server is not None:
+            self.start_model_pulling_in_worker(wait=10)
 
         if component_builder:
             self.component_builder = component_builder
@@ -151,10 +168,78 @@ class DataRouter(object):
         projects.extend(self._list_projects_in_cloud())
         return projects
 
+    def _run_model_pulling_worker(self, wait):
+        while True:
+            self._update_model_from_server(
+                self.model_server, self.path)
+            time.sleep(wait)
+
+    def start_model_pulling_in_worker(self, wait):
+        # type: (int) -> None
+        worker = Thread(target=self._run_model_pulling_worker,
+                        args=(wait,))
+        worker.setDaemon(True)
+        worker.start()
+
+    def _update_model_from_server(self,
+                                  model_server,  # type: Text
+                                  model_directory  # type: Text
+                                  ):
+        # type: (...) -> None
+        """Loads a zipped Rasa NLU model from a URL."""
+
+        if not is_url(model_server):
+            raise InvalidURL(model_server)
+
+        new_model_dir = self._pull_model_and_return_hash(
+            model_server, model_directory, self.model_hash)
+        if not new_model_dir:
+            logger.debug("No new model found at "
+                         "URL {}".format(model_server))
+
+    @staticmethod
+    def _pull_model_and_return_hash(model_server, model_directory, model_hash):
+        # type: (Text, Text, Text) -> Text
+        """Queries the model server and returns the value of the response's
+
+        <ETag> header which contains the model hash."""
+        header = {"If-None-Match": model_hash}
+        response = requests.get(model_server, headers=header)
+        response.raise_for_status()
+
+        if response.status_code == 204:
+            logger.debug("Model server returned 204 status code, indicating "
+                         "that no new model is available for hash {}"
+                         "".format(model_hash))
+            return response.headers.get("ETag")
+
+        zip_ref = zipfile.ZipFile(IOReader(response.content))
+        zip_ref.extractall(model_directory)
+        logger.debug("Unzipped model to {}"
+                     "".format(os.path.abspath(model_directory)))
+
+        return response.headers.get("ETag")
+
+    def init_model_from_server(self):
+        """Downloads and unzips a Rasa NLU model to project store.
+
+        Returns the model hash"""
+
+        if not is_url(self.model_server):
+            raise InvalidURL(self.model_server)
+
+        new_hash = self._pull_model_and_return_hash(
+            self.model_server, self.path)
+
+        return new_hash
+
     def _create_project_store(self, project_dir):
         projects = self._collect_projects(project_dir)
 
         project_store = {}
+
+        if self.model_server:
+            self.init_model_from_server(self.model_server)
 
         for project in projects:
             project_store[project] = Project(self.component_builder,
