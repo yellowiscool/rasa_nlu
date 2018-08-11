@@ -31,7 +31,8 @@ class Project(object):
                  component_builder=None,
                  project=None,
                  project_dir=None,
-                 remote_storage=None):
+                 remote_storage=None,
+                 model_server=None):
         self._component_builder = component_builder
         self._models = {}
         self.status = 0
@@ -43,6 +44,11 @@ class Project(object):
         self._path = None
         self._project = project
         self.remote_storage = remote_storage
+        self.model_server = model_server
+        self.model_hash = None
+
+        if model_server is not None:
+            self.start_model_pulling_in_worker(wait=10)
 
         if project and project_dir:
             self._path = os.path.join(project_dir, project)
@@ -253,6 +259,72 @@ class Project(object):
             logger.warn("Using default interpreter, couldn't fetch "
                         "model: {}".format(e))
             raise  # re-raise this exception because nothing we can do now
+
+    # TODO: THIS IS NEW
+    def _run_model_pulling_worker(self, wait):
+        while True:
+            self._update_model_from_server(
+                self.model_server, self.path)
+            time.sleep(wait)
+
+    def start_model_pulling_in_worker(self, wait):
+        # type: (int) -> None
+        worker = Thread(target=self._run_model_pulling_worker,
+                        args=(wait,))
+        worker.setDaemon(True)
+        worker.start()
+
+    def _update_model_from_server(self,
+                                  model_server,  # type: Text
+                                  model_directory  # type: Text
+                                  ):
+        # type: (...) -> None
+        """Loads a zipped Rasa NLU model from a URL."""
+
+        if not is_url(model_server):
+            raise InvalidURL(model_server)
+
+        new_model_dir = self._pull_model_and_return_hash(
+            model_server, model_directory, self.model_hash)
+        if not new_model_dir:
+            logger.debug("No new model found at "
+                         "URL {}".format(model_server))
+
+    @staticmethod
+    def _pull_model_and_return_hash(model_server, model_directory, model_hash):
+        # type: (Text, Text, Text) -> Text
+        """Queries the model server and returns the value of the response's
+
+        <ETag> header which contains the model hash."""
+        header = {"If-None-Match": model_hash}
+        response = requests.get(model_server, headers=header)
+        response.raise_for_status()
+
+        if response.status_code == 204:
+            logger.debug("Model server returned 204 status code, indicating "
+                         "that no new model is available for hash {}"
+                         "".format(model_hash))
+            return response.headers.get("ETag")
+
+        zip_ref = zipfile.ZipFile(IOReader(response.content))
+        zip_ref.extractall(model_directory)
+        logger.debug("Unzipped model to {}"
+                     "".format(os.path.abspath(model_directory)))
+
+        return response.headers.get("ETag")
+
+    def init_model_from_server(self, path):
+        """Downloads and unzips a Rasa NLU model to path.
+
+        Returns the model hash"""
+
+        if not is_url(self.model_server):
+            raise InvalidURL(self.model_server)
+
+        new_hash = self._pull_model_and_return_hash(
+            self.model_server, path)
+
+        return new_hash
 
     @staticmethod
     def _default_model_metadata():
