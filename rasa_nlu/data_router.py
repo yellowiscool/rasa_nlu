@@ -99,6 +99,8 @@ def deferred_from_future(future):
 
 
 class DataRouter(object):
+    remote_model_dir = "remote"
+
     def __init__(self,
                  project_dir=None,
                  max_training_processes=1,
@@ -114,7 +116,7 @@ class DataRouter(object):
         self.emulator = self._create_emulator(emulation_mode)
         self.remote_storage = remote_storage
         self.model_server = model_server
-        if self.model_server is not None:
+        if model_server is not None:
             self.start_model_pulling_in_worker(wait=10)
 
         if component_builder:
@@ -238,6 +240,7 @@ class DataRouter(object):
 
         project_store = {}
 
+        # TODO put remote models in default or its designated project?
         if self.model_server:
             self.init_model_from_server(self.model_server)
 
