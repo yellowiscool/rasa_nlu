@@ -4,20 +4,27 @@ from __future__ import print_function
 from __future__ import unicode_literals
 
 import datetime
-import glob
-
-import os
 import logging
-
+import os
+import time
+import zipfile
 from builtins import object
-from threading import Lock
-
-from rasa_nlu import utils
+from threading import Lock, Thread
 from typing import Text, List
 
+import requests
+import six
+from rasa_nlu import utils
 from rasa_nlu.classifiers.keyword_intent_classifier import \
     KeywordIntentClassifier
 from rasa_nlu.model import Metadata, Interpreter
+from rasa_nlu.utils import is_url
+from requests.exceptions import InvalidURL
+
+if six.PY2:
+    from StringIO import StringIO as IOReader
+else:
+    from io import BytesIO as IOReader
 
 logger = logging.getLogger(__name__)
 
@@ -46,9 +53,6 @@ class Project(object):
         self.remote_storage = remote_storage
         self.model_server = model_server
         self.model_hash = None
-
-        if model_server is not None:
-            self.start_model_pulling_in_worker(wait=10)
 
         if project and project_dir:
             self._path = os.path.join(project_dir, project)
@@ -190,7 +194,8 @@ class Project(object):
 
     def _search_for_models(self):
         model_names = (self._list_models_in_dir(self._path) +
-                       self._list_models_in_cloud())
+                       self._list_models_in_cloud() +
+                       self._model_name_at_model_server())
         if not model_names:
             if FALLBACK_MODEL_NAME not in self._models:
                 self._models[FALLBACK_MODEL_NAME] = self._fallback_model()
@@ -216,6 +221,9 @@ class Project(object):
             # download model from cloud storage if needed and possible
             if not os.path.isdir(path):
                 self._load_model_from_cloud(model_name, path)
+
+            if self.model_server:
+                self._load_model_from_model_server()
 
             return Metadata.load(path)
 
@@ -243,9 +251,22 @@ class Project(object):
             else:
                 return []
         except Exception as e:
-            logger.warn("Failed to list models of project {}. "
-                        "{}".format(self._project, e))
+            logger.warning("Failed to list models of project {}. "
+                           "{}".format(self._project, e))
             return []
+
+    def _model_name_at_model_server(self):
+        # type: () -> List[Text]
+        try:
+            r = requests.head(self.model_server)
+            r.raise_for_status()
+            filename = r.headers.get("filename")
+            if filename is not None:
+                return filename.split(".zip")[:1]
+        except Exception as e:
+            logger.warning("Failed to retrieve model from server {}.\n{}"
+                           "".format(self.model_server, e))
+        return []
 
     def _load_model_from_cloud(self, model_name, target_path):
         try:
@@ -256,9 +277,13 @@ class Project(object):
             else:
                 raise RuntimeError("Unable to initialize persistor")
         except Exception as e:
-            logger.warn("Using default interpreter, couldn't fetch "
-                        "model: {}".format(e))
+            logger.warning("Using default interpreter, couldn't fetch "
+                           "model: {}".format(e))
             raise  # re-raise this exception because nothing we can do now
+
+    def _load_model_from_model_server(self):
+        if self.model_server is not None:
+            self.start_model_pulling_in_worker(wait=10)
 
     # TODO: THIS IS NEW
     def _run_model_pulling_worker(self, wait):
@@ -312,19 +337,6 @@ class Project(object):
                      "".format(os.path.abspath(model_directory)))
 
         return response.headers.get("ETag")
-
-    def init_model_from_server(self, path):
-        """Downloads and unzips a Rasa NLU model to path.
-
-        Returns the model hash"""
-
-        if not is_url(self.model_server):
-            raise InvalidURL(self.model_server)
-
-        new_hash = self._pull_model_and_return_hash(
-            self.model_server, path)
-
-        return new_hash
 
     @staticmethod
     def _default_model_metadata():
