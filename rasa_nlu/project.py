@@ -35,6 +35,7 @@ class Project(object):
         self._component_builder = component_builder
         self._models = {}
         self.status = 0
+        self.current_training_processes = 0
         self._reader_lock = Lock()
         self._loader_lock = Lock()
         self._writer_lock = Lock()
@@ -121,16 +122,36 @@ class Project(object):
             self._loader_lock.release()
 
         response = self._models[model_name].parse(text, time)
+        response['project'] = self._project
+        response['model'] = model_name
 
         self._end_read()
 
-        return response, model_name
+        return response
+
+    def load_model(self):
+        self._begin_read()
+        status = False
+        model_name = self._dynamic_load_model()
+        logger.debug('Loading model %s', model_name)
+
+        self._loader_lock.acquire()
+        try:
+            if not self._models.get(model_name):
+                interpreter = self._interpreter_for_model(model_name)
+                self._models[model_name] = interpreter
+                status = True
+        finally:
+            self._loader_lock.release()
+
+        self._end_read()
+
+        return status
 
     def update(self, model_name):
         self._writer_lock.acquire()
         self._models[model_name] = None
         self._writer_lock.release()
-        self.status = 0
 
     def unload(self, model_name):
         self._writer_lock.acquire()
@@ -194,6 +215,7 @@ class Project(object):
 
     def as_dict(self):
         return {'status': 'training' if self.status else 'ready',
+                'current_training_processes': self.current_training_processes,
                 'available_models': list(self._models.keys()),
                 'loaded_models': self._list_loaded_models()}
 

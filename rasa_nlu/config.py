@@ -3,6 +3,7 @@ from __future__ import division
 from __future__ import print_function
 from __future__ import unicode_literals
 
+import copy
 import logging
 import os
 
@@ -54,7 +55,10 @@ def load(filename=None, **kwargs):
 
 
 def override_defaults(defaults, custom):
-    cfg = defaults or {}
+    if defaults:
+        cfg = copy.deepcopy(defaults)
+    else:
+        cfg = {}
     if custom:
         cfg.update(custom)
     return cfg
@@ -65,6 +69,19 @@ def make_path_absolute(path):
         return os.path.join(os.getcwd(), path)
     else:
         return path
+
+
+def component_config_from_pipeline(
+        name,  # type: Text
+        pipeline,  # type: List[Dict[Text, Any]]
+        defaults=None  # type: Optional[Dict[Text, Any]]
+):
+    # type: (...) -> Dict[Text, Any]
+    for c in pipeline:
+        if c.get("name") == name:
+            return override_defaults(defaults, c)
+    else:
+        return override_defaults(defaults, {})
 
 
 class RasaNLUModelConfig(object):
@@ -134,11 +151,7 @@ class RasaNLUModelConfig(object):
         return json_to_string(self.__dict__, indent=4)
 
     def for_component(self, name, defaults=None):
-        for c in self.pipeline:
-            if c.get("name") == name:
-                return override_defaults(defaults, c)
-        else:
-            return defaults or {}
+        return component_config_from_pipeline(name, self.pipeline, defaults)
 
     @property
     def component_names(self):

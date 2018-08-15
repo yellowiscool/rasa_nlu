@@ -43,16 +43,15 @@ logger = logging.getLogger(__name__)
 DEFERRED_RUN_IN_REACTOR_THREAD = True
 
 
-class AlreadyTrainingError(Exception):
-    """Raised when a training is requested for a project that is
-       already training.
-
+class MaxTrainingError(Exception):
+    """Raised when a training is requested and the server has
+        reached the max count of training processes.
     Attributes:
         message -- explanation of why the request is invalid
     """
 
     def __init__(self):
-        self.message = 'The project is already being trained!'
+        self.message = 'The server can\'t train more models right now!'
 
     def __str__(self):
         return self.message
@@ -61,7 +60,6 @@ class AlreadyTrainingError(Exception):
 def deferred_from_future(future):
     """Converts a concurrent.futures.Future object to a
        twisted.internet.defer.Deferred object.
-
     See:
     https://twistedmatrix.com/pipermail/twisted-python/2011-January/023296.html
     """
@@ -93,8 +91,8 @@ class DataRouter(object):
                  emulation_mode=None,
                  remote_storage=None,
                  component_builder=None):
-
         self._training_processes = max(max_training_processes, 1)
+        self._current_training_processes = 0
         self.responses = self._create_query_logger(response_log)
         self.project_dir = config.make_path_absolute(project_dir)
         self.emulator = self._create_emulator(emulation_mode)
@@ -128,11 +126,10 @@ class DataRouter(object):
             # Instantiate a standard python logger,
             # which we are going to use to log requests
             utils.create_dir_for_file(response_logfile)
+            out_file = io.open(response_logfile, 'a', encoding='utf8')
             query_logger = Logger(
-                observer=jsonFileLogObserver(
-                        io.open(response_logfile, 'a', encoding='utf8'),
-                        recordSeparator=''),
-                namespace='query-logger')
+                    observer=jsonFileLogObserver(out_file, recordSeparator=''),
+                    namespace='query-logger')
             # Prevents queries getting logged with parent logger
             # --> might log them to stdout
             logger.info("Logging requests to '{}'.".format(response_logfile))
@@ -166,9 +163,16 @@ class DataRouter(object):
         if not project_store:
             default_model = RasaNLUModelConfig.DEFAULT_PROJECT_NAME
             project_store[default_model] = Project(
+                    project=RasaNLUModelConfig.DEFAULT_PROJECT_NAME,
                     project_dir=self.project_dir,
                     remote_storage=self.remote_storage)
         return project_store
+
+    def _pre_load(self, projects):
+        logger.debug("loading %s", projects)
+        for project in self.project_store:
+            if project in projects:
+                self.project_store[project].load_model()
 
     def _list_projects_in_cloud(self):
         try:
@@ -187,7 +191,6 @@ class DataRouter(object):
     @staticmethod
     def _create_emulator(mode):
         """Create emulator for specified mode.
-
         If no emulator is specified, we will use the Rasa NLU format."""
 
         if mode is None:
@@ -220,7 +223,7 @@ class DataRouter(object):
 
             if project not in projects:
                 raise InvalidProjectError(
-                    "No project found with name '{}'.".format(project))
+                        "No project found with name '{}'.".format(project))
             else:
                 try:
                     self.project_store[project] = Project(
@@ -228,17 +231,16 @@ class DataRouter(object):
                             self.project_dir, self.remote_storage)
                 except Exception as e:
                     raise InvalidProjectError(
-                        "Unable to load project '{}'. Error: {}".format(
-                            project, e))
+                            "Unable to load project '{}'. "
+                            "Error: {}".format(project, e))
 
         time = data.get('time')
-        response, used_model = self.project_store[project].parse(data['text'],
-                                                                 time,
-                                                                 model)
+        response = self.project_store[project].parse(data['text'], time,
+                                                     model)
 
         if self.responses:
             self.responses.info('', user_input=response, project=project,
-                                model=used_model)
+                                model=response.get('model'))
 
         return self.format_response(response)
 
@@ -255,9 +257,9 @@ class DataRouter(object):
         predictions = []
         for ex in examples:
             logger.debug("Going to parse: {}".format(ex.as_dict()))
-            response, _ = self.project_store[project].parse(ex.text,
-                                                            None,
-                                                            model)
+            response = self.project_store[project].parse(ex.text,
+                                                         None,
+                                                         model)
             logger.debug("Received response: {}".format(response))
             predictions.append(response)
 
@@ -272,22 +274,29 @@ class DataRouter(object):
         # be other trainings run in different processes we don't know about.
 
         return {
+            "max_training_processes": self._training_processes,
+            "current_training_processes": self._current_training_processes,
             "available_projects": {
                 name: project.as_dict()
                 for name, project in self.project_store.items()
             }
         }
 
-    def start_train_process(self, data_file, project, train_config):
-        # type: (Text, Text, RasaNLUModelConfig) -> Deferred
+    def start_train_process(self,
+                            data_file,  # type: Text
+                            project,  # type: Text
+                            train_config,  # type: RasaNLUModelConfig
+                            model_name=None  # type: Optional[Text]
+                            ):
+        # type: (...) -> Deferred
         """Start a model training."""
 
         if not project:
             raise InvalidProjectError("Missing project name to train")
 
         if project in self.project_store:
-            if self.project_store[project].status == 1:
-                raise AlreadyTrainingError
+            if self._training_processes <= self._current_training_processes:
+                raise MaxTrainingError
             else:
                 self.project_store[project].status = 1
         elif project not in self.project_store:
@@ -299,23 +308,38 @@ class DataRouter(object):
         def training_callback(model_path):
             model_dir = os.path.basename(os.path.normpath(model_path))
             self.project_store[project].update(model_dir)
+            self._current_training_processes -= 1
+            self.project_store[project].current_training_processes -= 1
+            if (self.project_store[project].status == 1 and
+                    self.project_store[project].current_training_processes ==
+                    0):
+                self.project_store[project].status = 0
             return model_dir
 
         def training_errback(failure):
             logger.warn(failure)
             target_project = self.project_store.get(
-                failure.value.failed_target_project)
-            if target_project:
+                    failure.value.failed_target_project)
+            self._current_training_processes -= 1
+            self.project_store[project].current_training_processes -= 1
+            if (target_project and
+                    self.project_store[project].current_training_processes ==
+                    0):
                 target_project.status = 0
             return failure
 
         logger.debug("New training queued")
 
+        self._current_training_processes += 1
+        self.project_store[project].current_training_processes += 1
+
         result = self.pool.submit(do_train_in_worker,
                                   train_config,
                                   data_file,
                                   path=self.project_dir,
-                                  project=project)
+                                  project=project,
+                                  fixed_model_name=model_name,
+                                  storage=self.remote_storage)
         result = deferred_from_future(result)
         result.addCallback(training_callback)
         result.addErrback(training_errback)
@@ -370,7 +394,7 @@ class DataRouter(object):
         """Unload a model from server memory."""
 
         if project is None:
-            raise InvalidProjectError("No project specified".format(project))
+            raise InvalidProjectError("No project specified")
         elif project not in self.project_store:
             raise InvalidProjectError("Project {} could not "
                                       "be found".format(project))

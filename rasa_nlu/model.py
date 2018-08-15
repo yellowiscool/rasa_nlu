@@ -25,10 +25,11 @@ from rasa_nlu.utils import create_dir, write_json_to_file
 
 logger = logging.getLogger(__name__)
 
+MINIMUM_COMPATIBLE_VERSION = "0.12.0"
+
 
 class InvalidProjectError(Exception):
     """Raised when a model failed to load.
-
     Attributes:
         message -- explanation of why the model is invalid
     """
@@ -40,9 +41,8 @@ class InvalidProjectError(Exception):
         return self.message
 
 
-class UnsuportedModelError(Exception):
+class UnsupportedModelError(Exception):
     """Raised when a model is to old to be loaded.
-
     Attributes:
         message -- explanation of why the model is invalid
     """
@@ -60,7 +60,12 @@ class Metadata(object):
     @staticmethod
     def load(model_dir):
         # type: (Text) -> 'Metadata'
-        """Loads the metadata from a models directory."""
+        """Loads the metadata from a models directory.
+        Args:
+            model_dir (str): the directory where the model is saved.
+        Returns:
+            Metadata: A metadata object describing the model
+        """
         try:
             metadata_file = os.path.join(model_dir, 'metadata.json')
             data = utils.read_json_file(metadata_file)
@@ -87,11 +92,9 @@ class Metadata(object):
             return []
 
     def for_component(self, name, defaults=None):
-        for c in self.get('pipeline', []):
-            if c.get("name") == name:
-                return override_defaults(defaults, c)
-        else:
-            return defaults or {}
+        return config.component_config_from_pipeline(name,
+                                                     self.get('pipeline', []),
+                                                     defaults)
 
     @property
     def language(self):
@@ -117,7 +120,6 @@ class Metadata(object):
 
 class Trainer(object):
     """Trainer will load the data and train all components.
-
     Requires a pipeline specification and configuration to use for
     the training."""
 
@@ -198,7 +200,6 @@ class Trainer(object):
                 fixed_model_name=None):
         # type: (Text, Optional[Persistor], Text) -> Text
         """Persist all components of the pipeline to the passed path.
-
         Returns the directory of the persisted model."""
 
         timestamp = datetime.datetime.now().strftime('%Y%m%d-%H%M%S')
@@ -241,44 +242,53 @@ class Trainer(object):
 
 
 class Interpreter(object):
-    """Use a trained pipeline of components to parse text messages"""
+    """Use a trained pipeline of components to parse text messages."""
 
     # Defines all attributes (& default values)
     # that will be returned by `parse`
     @staticmethod
     def default_output_attributes():
-        return {"intent": {"name": "", "confidence": 0.0}, "entities": []}
+        return {"intent": {"name": None, "confidence": 0.0}, "entities": []}
 
     @staticmethod
-    def ensure_model_compatibility(metadata):
+    def ensure_model_compatibility(metadata, version_to_check=None):
         from packaging import version
 
+        if version_to_check is None:
+            version_to_check = MINIMUM_COMPATIBLE_VERSION
+
         model_version = metadata.get("rasa_nlu_version", "0.0.0")
-        if version.parse(model_version) < version.parse("0.12.0a2"):
-            raise UnsuportedModelError("The model version is to old to be "
-                                       "loaded by this Rasa NLU instance. "
-                                       "Either retrain the model, or run with"
-                                       "an older version. "
-                                       "Model version: {} Instance version: {}"
-                                       "".format(model_version,
-                                                 rasa_nlu.__version__))
+        if version.parse(model_version) < version.parse(version_to_check):
+            raise UnsupportedModelError(
+                "The model version is to old to be "
+                "loaded by this Rasa NLU instance. "
+                "Either retrain the model, or run with"
+                "an older version. "
+                "Model version: {} Instance version: {}"
+                "".format(model_version, rasa_nlu.__version__))
 
     @staticmethod
-    def load(model_dir, component_builder=None, skip_valdation=False):
-        """Creates an interpreter based on a persisted model."""
+    def load(model_dir, component_builder=None, skip_validation=False):
+        """Create an interpreter based on a persisted model.
+        Args:
+            model_dir (str): The path of the model to load
+            component_builder (ComponentBuilder): The
+                :class:`ComponentBuilder` to use.
+        Returns:
+            Interpreter: An interpreter that uses the loaded model.
+        """
 
         model_metadata = Metadata.load(model_dir)
 
         Interpreter.ensure_model_compatibility(model_metadata)
-
         return Interpreter.create(model_metadata,
                                   component_builder,
-                                  skip_valdation)
+                                  skip_validation)
 
     @staticmethod
     def create(model_metadata,  # type: Metadata
                component_builder=None,  # type: Optional[ComponentBuilder]
-               skip_valdation=False  # type: bool
+               skip_validation=False  # type: bool
                ):
         # type: (...) -> Interpreter
         """Load stored model and components defined by the provided metadata."""
@@ -294,7 +304,7 @@ class Interpreter(object):
 
         # Before instantiating the component classes,
         # lets check if all required packages are available
-        if not skip_valdation:
+        if not skip_validation:
             components.validate_requirements(model_metadata.component_classes)
 
         for component_name in model_metadata.component_classes:
@@ -322,7 +332,6 @@ class Interpreter(object):
     def parse(self, text, time=None, only_output_properties=True):
         # type: (Text) -> Dict[Text, Any]
         """Parse the input text, classify it and return pipeline result.
-
         The pipeline result usually contains intent and entities."""
 
         if not text:
