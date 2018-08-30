@@ -43,6 +43,17 @@ def ner_crf_pos_feature_config():
 
 
 @pytest.fixture(scope="session")
+def ner_crf_non_pos_feature_config():
+    return {
+        "features": [
+            ["low", "title", "upper"],
+            ["bias", "low", "suffix3", "suffix2", "upper",
+             "title", "digit", "pattern"],
+            ["low", "title", "upper"]]
+    }
+
+
+@pytest.fixture(scope="session")
 def mitie_feature_extractor(component_builder, default_config):
     return component_builder.create_component("nlp_mitie", default_config).extractor
 

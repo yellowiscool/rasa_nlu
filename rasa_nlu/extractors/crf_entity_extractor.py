@@ -211,6 +211,7 @@ class CRFEntityExtractor(EntityExtractor):
             return "", 0.0
 
     def _create_entity_dict(self, tokens, start, end, entity, confidence):
+        import pdb; pdb.set_trace()
         if self.pos_features:
             _start = tokens[start].idx
             _end = tokens[start:end + 1].end_char
@@ -218,6 +219,7 @@ class CRFEntityExtractor(EntityExtractor):
         else:
             _start = tokens[start].offset
             _end = tokens[end].end
+            value = tokens[start:end + 1].text
             value = ' '.join(t.text for t in tokens[start:end + 1])
 
         return {
@@ -292,7 +294,7 @@ class CRFEntityExtractor(EntityExtractor):
 
     def _from_crf_to_json(self, message, entities):
         # type: (Message, List[Any]) -> List[Dict[Text, Any]]
-
+        import pdb; pdb.set_trace()
         if self.pos_features:
             tokens = message.get("spacy_doc")
         else:
