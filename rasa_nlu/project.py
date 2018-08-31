@@ -52,7 +52,7 @@ class Project(object):
         self._project = project
         self.remote_storage = remote_storage
         self.model_server = model_server
-        self.model_hash = None
+        self.fingerprint = None
 
         if project and project_dir:
             self._path = os.path.join(project_dir, project)
@@ -285,11 +285,10 @@ class Project(object):
         if self.model_server is not None:
             self.start_model_pulling_in_worker(wait=10)
 
-    # TODO: THIS IS NEW
     def _run_model_pulling_worker(self, wait):
         while True:
             self._update_model_from_server(
-                self.model_server, self.path)
+                    self.model_server, self._path)
             time.sleep(wait)
 
     def start_model_pulling_in_worker(self, wait):
@@ -309,26 +308,30 @@ class Project(object):
         if not is_url(model_server):
             raise InvalidURL(model_server)
 
-        new_model_dir = self._pull_model_and_return_hash(
-            model_server, model_directory, self.model_hash)
-        if not new_model_dir:
+        new_fingerprint = self._pull_model_and_return_fingerprint(
+                model_server, model_directory, self.fingerprint)
+        if new_fingerprint:
+            logger.debug("New model with fingerprint {}"
+                         "found at {}".format(new_fingerprint, model_server))
+        else:
             logger.debug("No new model found at "
                          "URL {}".format(model_server))
 
     @staticmethod
-    def _pull_model_and_return_hash(model_server, model_directory, model_hash):
+    def _pull_model_and_return_fingerprint(model_server, model_directory,
+                                           fingerprint):
         # type: (Text, Text, Text) -> Text
         """Queries the model server and returns the value of the response's
 
-        <ETag> header which contains the model hash."""
-        header = {"If-None-Match": model_hash}
+        <ETag> header which contains the model fingerprint."""
+        header = {"If-None-Match": fingerprint}
         response = requests.get(model_server, headers=header)
         response.raise_for_status()
 
         if response.status_code == 204:
             logger.debug("Model server returned 204 status code, indicating "
-                         "that no new model is available for hash {}"
-                         "".format(model_hash))
+                         "that no new model is available for fingerprint {}"
+                         "".format(fingerprint))
             return response.headers.get("ETag")
 
         zip_ref = zipfile.ZipFile(IOReader(response.content))
